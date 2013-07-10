@@ -1,0 +1,159 @@
+#!/usr/bin/perl 
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+#
+#
+#
+# Nagios check for detecting hardware problems with Hitachi HNAS cluster
+# using snmp queries against the admin-evs of the cluster.
+# Mib files can be downloaded from GUI of the SMU, under documentation and dropped into the default mib-location
+#
+#
+use warnings;
+use strict; 
+use SNMP::Simple;
+use Getopt::Long;
+use Data::Dumper;
+my $hostname; 
+my $community; 
+
+GetOptions("hostname=s"   => \$hostname,
+           "community=s"     => \$community,
+    );
+unless ( $hostname && $community ) {
+ usage();
+}
+
+# Load the hnas mib. Files must be in default mib dir for the system.
+&SNMP::loadModules('BLUEARC-SERVER-MIB');
+
+my $warnings;
+
+my $s = new SNMP::Simple(DestHost => $hostname, Community => $community , Version => 2);
+
+#BLUEARC-SERVER-MIB::clusterPNodeTable
+my @clusterpnodetable = $s->get_table('clusterPNodeId','clusterPNodeName','clusterPNodeStatus');
+my %nodenames;
+my %nodestatus; 
+
+# Store node names and status indexed by node ID
+foreach my $n (@clusterpnodetable) {
+ $nodenames{$n->[0]} = $n->[1]; 
+ $nodestatus{$n->[0]} = $n->[2]; 
+}
+
+# BLUEARC-SERVER-MIB::fanTable
+my @fantable = $s->get_table('fanClusterNode', 'fanIndex','fanFittedStatus', 'fanSpeedStatus');
+
+foreach (@fantable) {
+ if ($_->[2] ne 'ok' ) { 
+  push(@{$warnings->{$_->[0]}->{'Fan(s) not fitted'}},$_->[1]); 
+ }
+ if ($_->[3] ne 'ok' ) { 
+  push(@{$warnings->{$_->[0]}->{'Fan(s) with speed out of spec'}},$_->[1]); 
+ }
+}
+
+# BLUEARC-SERVER-MIB::temperatureSensorTable
+my @temperaturesensortable = $s->get_table('temperatureSensorClusterNode','temperatureSensorIndex','temperatureSensorStatus');
+
+foreach (@temperaturesensortable) {
+ if ($_->[2] ne 'ok' ) { 
+  push(@{$warnings->{$_->[0]}->{'Temperature(s) outside of spec'}},$_->[1]); 
+ }
+}
+
+# BLUEARC-SERVER-MIB::psuTable
+my @psutable = $s->get_table('psuClusterNode','psuIndex','psuStatus');
+
+foreach (@psutable) {
+ if ($_->[2] ne 'ok' ) { 
+  push(@{$warnings->{$_->[0]}->{'Powersupply(ies) not ok'}},$_->[1]); 
+ }
+}
+
+# BLUEARC-SERVER-MIB::chassisDriveTable
+my @chassisdrivetable = $s->get_table('chassisDriveClusterNode','chassisDriveIndex','chassisDriveStatus');
+
+foreach (@chassisdrivetable) {
+ if ($_->[2] ne 'raidGood' ) { 
+  push(@{$warnings->{$_->[0]}->{'Chassis drive(s) not good'}},$_->[1]); 
+ }
+}
+
+# BLUEARC-SERVER-MIB::batteryTable
+my @batterytable = $s->get_table('batteryClusterNode','batteryIndex','batteryStatus');
+
+foreach (@batterytable) {
+ if ($_->[2] ne 'ok' ) { 
+  push(@{$warnings->{$_->[0]}->{'Battery(ies) not ok'}},$_->[1]); 
+ }
+}
+
+# BLUEARC-SERVER-MIB::clusterVNodeTable
+my @vnodetable = $s->get_table('clusterVNodeId','clusterVNodeName','clusterVNodeStatus','clusterVNodeHostedBy');
+
+# Check if any pnode has vnodes (evs'es) that is not online. 
+#
+foreach (@vnodetable) {
+ if ($_->[2] ne 'onLine' ) { 
+  push(@{$warnings->{$_->[3]}->{'EVS(es) not online'}},$_->[1]); 
+ }
+}
+
+#BLUEARC-SERVER-MIB::serialNumberTable
+my @serialnumbertable = $s->get_table('componentType','subComponentType','clusterNode','serialNumber');
+my %nodesn;
+
+# Store node serial numbers indexed by node ID
+# Only chassis serialnumber (physical node) 
+foreach my $n (@serialnumbertable) {
+ if ( $n->[0] eq 'chassis' ) { 
+  $nodesn{$n->[2]} = $n->[3]; 
+ }
+}
+
+
+# sysDriveTable
+my @sysdrivetable = $s->get_table('sysDriveIndex','sysDriveStatus');
+foreach (@sysdrivetable) {
+ if ($_->[1] ne 'online' ) { 
+  push(@{$warnings->{1}->{'System drive(s) not online'}},$_->[0]); 
+ }
+}
+
+# BLUEARC-SERVER-MIB::volumeTable
+my @volumetable = $s->get_table('volumeLabel','volumeStatus','volumeEnterpriseVirtualServer');
+foreach (@volumetable) {
+ if ($_->[1] ne 'mounted' ) { 
+  push(@{$warnings->{1}->{'Volume(s) not mounted'}},$_->[0]); 
+ }
+}
+
+if ( ! defined($warnings)) {
+  print "OK: HNAS cluster is working properly\n";
+  exit 0;
+}
+
+foreach my $w (keys %{$warnings}) {
+ print "Node $nodenames{$w} ( SN:$nodesn{$w} ) has warnings:\n";
+ foreach my $nw (keys %{$warnings->{$w}} ) {
+  print "  $nw: ".join(",",@{$warnings->{$w}->{$nw}})."\n";
+ }
+}
+exit 2;
+sub usage {
+  print "$0 --hostname <fqdn or ip > --community <snmp community string>\n";
+  exit 1;
+}
