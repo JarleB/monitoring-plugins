@@ -1,0 +1,249 @@
+#!/usr/bin/perl 
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+
+# This is a passive nagios checker for detecting if cf-agents
+# have gone AWOL (Absent WithOut Leave) from the cf-server(s).
+#
+# It reads a file with hostnames (FQDN) that we care about
+# being in touch, and needs the FQDN of the nagios server and the NSCA parameters 
+# (location of the nsca program and configuration file) 
+# Also it needs a comma separated list of cfengine servers that agents
+# talk to. If the list is not complete there will be false positives.
+# 
+# The script checks that the cf-agent of each host in the list 
+# has been in touch with at least one of the servers within the 
+# --warn number of minuts and sends an alarm if not. 
+#
+# cf-key -s is used for checking when agents were last seen. Only version
+# > 3.4.0 have the timestamp column so earlier versions will not work.
+# Also, there is a bug in cf-key that truncates IPv6 addresses becaus most
+# of the IPv6 addresses is longer than the address field width of the 
+# cf-keys -s output. 
+#
+# See https://github.com/cfengine/core/pull/799 in order to know how to fix
+# if you have IPv6 addresses. (Modify two lines of code and recompile cf-key. )
+#
+# The module needs passwordless login as root (and no interaction with host key
+# acceptance ) via ssh to all servers in the --cfengine-servers list 
+# order to collect cf-key -s output. The path to ssh and cf-key 
+#
+# The script warns, for each of the hosts in the list, if: 
+#  * none of the  DNS-registered PTR-records  (IP4/IP6) of a hostnamie has been in 
+#    touch  with the server at all. 
+#  * none of the  DNS-registered PTR-records has been seen by any of the 
+#    servers within ---warn minutes.
+#
+# Hosts that should be ignored can be specified with the --filter-file option.
+
+use warnings;
+use strict;
+use Getopt::Long;
+use Net::IP;
+use Net::DNS;
+use Date::Parse;
+#use Data::Dumper;
+
+
+my $f_hosts;
+my $f_nsca_conf;
+my $send_nsca;
+my $f_filter;
+my $nagios_server;
+my $cfengine_servers;
+my $reporting_hostname;
+my $debug;
+my $ssh = '/usr/bin/ssh' ;
+my $t_warn = 120 ;
+
+GetOptions("hosts-file=s"               => \$f_hosts,
+           "filter-file=s"              => \$f_filter,
+           "nsca-config=s"              => \$f_nsca_conf,
+           "warn=s"                     => \$t_warn,
+           "send-nsca=s"                => \$send_nsca,
+           "nagios-server=s"            => \$nagios_server,
+           "cfengine-servers=s"         => \$cfengine_servers,
+           "reporting-hostname=s"       => \$reporting_hostname,
+           "debug"                      => \$debug,
+    );
+
+unless ( $f_hosts && $f_nsca_conf && $nagios_server && $cfengine_servers ) {
+  usage()
+}
+
+my @cfengine_servers;
+
+if ( $cfengine_servers =~ /,/ ) {
+   @cfengine_servers = split(',',$cfengine_servers);
+} else {
+   @cfengine_servers = ($cfengine_servers);
+}
+
+my $excluded_hosts;
+
+if ( $f_filter ) {
+ $excluded_hosts = get_filter();
+}
+
+my $hosts = get_hosts();
+my $lastseen_times = get_lastseen_times(@cfengine_servers);
+my $now = time();
+my %lastseen_hosts;
+my @notseen = ();
+
+foreach my $host (keys %{$hosts}) {
+  my $seen = 0;
+  foreach my $addr ( @{$hosts->{$host}} ) {
+   if ( $lastseen_times->{$addr} ) {
+    $seen = 1;
+    my $ago_min  = ($now - $lastseen_times->{$addr} ) / 60 ;
+    if ( ! $lastseen_hosts{$host} || $lastseen_hosts{$host} > $ago_min ) {
+     $lastseen_hosts{$host} = $ago_min;
+    }
+   }
+  } 
+  push(@notseen,$host) if $seen == 0;
+}
+
+
+# Build Nagios message
+my $nagios_msg ;
+foreach my $h ( sort keys %lastseen_hosts ) {
+  $nagios_msg = $nagios_msg.sprintf("%-40s not seen for %-6.1f minutes\\n",$h,$lastseen_hosts{$h}) if $lastseen_hosts{$h} > $t_warn;
+}
+
+
+if ($nagios_msg || $notseen[0]) {
+ if ( $notseen[0] ) {
+   $nagios_msg .= 'cf-agents on hosts: \n'.join(',',@notseen)."\\nhave never been seen\n";
+ } 
+ send_status('warn','cf-agents has gone AWOL (Absent WithOut Leave). Click for details.\n'.$nagios_msg);
+} else {
+ send_status('ok',"All cf-agents in the host list has been in touch since $t_warn minutes ago\n");
+}
+
+#################### SUB #######################
+sub usage {
+ print "$0: --hosts-file <file-with-list-of-hosts to check for> \\\n";
+ print "--nsca-config  <file-with-inscs-config> \\\n";
+ print "--send-nsca  <location-of-send-nsca> \\\n";
+ print "--nagios-server  <name/ip of nagios server> \\\n";
+ print "--cfengine-servers  <FQDN of host(s) running cf-serverd. Comma separated if more than one\\\n";
+ print "[--reporting-hostname]  <name-of-reporting-host (default=hostname)> \\\n";
+ print "[--warn]  <warning limit in number of minutes (default 120) \\\n";
+ print "[--debug]  <print debug messages to STDOUT and not to nagios> \\\n";
+ exit 1;
+}
+
+sub get_filter {
+ my $ret;
+ open(FILTER, "< $f_filter") ||
+        die "Can't open $f_filter: $!\n";
+ while (<FILTER>) {
+  chomp;
+  next if /^$/;
+  next unless /\./;
+  $ret->{$_} = 1;
+ }
+ close(FILTER);
+ return $ret;
+}
+
+sub get_hosts {
+ my $res = Net::DNS::Resolver->new;
+ my $ret;
+ open(HOST_LIST, "< $f_hosts") ||
+        die "Can't open $f_hosts: $!\n";
+ while (<HOST_LIST>) {
+  next if /^$/;
+  next if ! /\./;
+  chomp;
+  my $aaaa = $res->query($_,"AAAA");
+  my $a = $res->query($_,"A");
+  if ( ! $aaaa && ! $a ) { 
+    print "$_ not resolvable in DNS\n" if $debug;
+    next;
+  }
+  if ( $excluded_hosts->{$_} ) {
+    print "$_ excluded in filter\n" if $debug ;
+    next;
+  }
+  if ($aaaa){
+   foreach my $rr ($aaaa->answer) {
+    my $ip = new Net::IP ( $rr->address ) || die $!;
+    push(@{$ret->{$_}},$ip->short());
+   }
+  }
+  if ($a){
+   foreach my $rr ($a->answer) {
+    push(@{$ret->{$_}},$rr->address);
+   }
+  }
+ }
+ close(HOST_LIST);
+ return $ret;
+}
+
+sub get_lastseen_times {
+ my @cfservers = @_;
+ my $lastseen_cmd = '/var/cfengine/bin/cf-key-patched-for-ipv6-output -s';
+ my $ret;
+ foreach my $cfserver ( @cfservers ) {
+  foreach my $entry ( `$ssh $cfserver $lastseen_cmd` ) {
+   next if $entry !~ /^Incoming.+/ ;
+   chomp($entry);
+   my ($inout,$ip,$name,$wday,$month,$mday,$timeofday,$yr,$md5) = split(' ',$entry);
+   my $ltime = str2time("$wday $month $mday $timeofday $yr");
+   unless ($ret->{$ip} && $ret->{$ip} > $ltime) {
+    $ret->{$ip} = $ltime;
+   }
+  }
+ }
+ return $ret;
+}
+
+sub send_status {
+ my $nsca_cmd = "$send_nsca -c $f_nsca_conf -H $nagios_server";
+ my $nagios_service = "cfengine-lastseen";
+ my %statusmap;
+ $statusmap{'ok'} = 0;
+ $statusmap{'warn'} = 1;
+ $statusmap{'crit'} = 2;
+ $statusmap{'unknown'} = 3;
+ my $status = shift;
+ my $msg = shift;
+ $status = $statusmap{$status};
+ my $hostname; 
+ unless ($reporting_hostname) {
+   $hostname = `hostname`;chomp($hostname);
+ }
+ unless ($debug) {
+  open(NSCA, "| $nsca_cmd > /dev/null 2>&1") || die "nsca failed: $!\n";
+  print NSCA "$hostname\t$nagios_service\t$status\t$msg\n";
+  close(NSCA);
+  return;
+ }
+ print "$hostname\t$nagios_service\t$status\t$msg\n";
+}
+
+sub readfile {
+  my $f_name = shift;
+  local $/=undef;
+  open FILE, $f_name or die "Couldn't open file $f_name: $!";
+  my $ret = <FILE>;
+  close FILE;
+  return $ret;
+}
+
